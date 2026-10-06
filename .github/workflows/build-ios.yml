@@ -1,0 +1,176 @@
+# 在 GitHub Actions 的 Apple Silicon macOS runner 上构建 DSH（dsh-ios），
+# 产出【未签名】的 ipa，供你在 Windows 上用 Sideloadly / AltStore 自行签名装到 iPhone。
+#
+# 为什么必须是 macOS（且必须 arm64）：
+#   1. iOS 的编译器和 SDK 只存在于 Xcode，Xcode 只跑在 macOS 上；
+#   2. 本项目的 AArch64 gadgets 是 host arm64 汇编，iOS 工程也只保留 arm64 切片
+#      （AppDSH.xcconfig: ARCHS[sdk=iphonesimulator*] = arm64）；
+#   3. guest 镜像不是交叉编译的，而是 "在 Mac 上跑同款 iSH 模拟器" 构建出来的
+#      （Makefile 的 rootfs 目标 → scripts/build-rootfs.sh）。
+#
+# 用法：把这个文件放到你 fork 出来的仓库的 .github/workflows/build-ios.yml，
+#       然后在 Actions 页面手动 Run workflow。
+name: Build DSH for iPhone (unsigned ipa)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 必须是 Apple Silicon（arm64）镜像：本项目的 AArch64 gadgets 是 host arm64 汇编，
+    # 在 Intel（x64）镜像上根本构建不出来。
+    #
+    # 标签对照（来自 actions/runner-images 的 Available Images 表）：
+    #   arm64 ✅  macos-26 / macos-latest / macos-26-xlarge
+    #   x64   ❌  macos-26-intel / macos-26-large / macos-latest-large
+    #
+    # 注意：macos-26-arm64 看着最像 Apple Silicon，但它【不是有效标签】——
+    # 那是 runner-images 仓库里的 Readme 文件名，不是 YAML 标签，填了会直接找不到 runner。
+    runs-on: macos-26
+    timeout-minutes: 150
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 选择可用的最新 Xcode
+        run: |
+          set -euo pipefail
+          echo "== 镜像内可用的 Xcode =="
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo
+          echo "== 当前默认 =="
+          xcode-select -p
+          xcodebuild -version
+
+          # 挑版本号最大的一个。注意 macOS 自带的 BSD sort 不支持 -V，
+          # 所以按 major/minor 数值排序。
+          LATEST_VER="$(ls -d /Applications/Xcode*.app 2>/dev/null \
+            | sed -nE 's#^/Applications/Xcode_([0-9]+(\.[0-9]+)*)\.app$#\1#p' \
+            | sort -t. -k1,1n -k2,2n \
+            | tail -1)"
+
+          if [ -n "$LATEST_VER" ]; then
+            echo "选中 Xcode_${LATEST_VER}.app"
+            sudo xcode-select -s "/Applications/Xcode_${LATEST_VER}.app"
+          else
+            echo "没有带版本号的 Xcode_*.app，沿用默认"
+          fi
+
+          echo "== 最终使用 =="
+          xcode-select -p
+          xcodebuild -version
+
+      - name: 安装构建依赖（meson / ninja / lld）
+        run: |
+          set -euo pipefail
+          brew install meson ninja
+
+          # Makefile 的 emulator 目标会检查 ld.lld —— 缺了它 guest 的 VDSO 构建不出来，
+          # guest 直接跑不起来。镜像里通常已经装了 Homebrew 的 LLVM，它的 bin 目录里
+          # 就带 ld.lld，直接复用能省掉重新下载一整个 LLVM；确实没有才单独装 lld。
+          LLD_BIN=""
+          for prefix in "$(brew --prefix llvm@20 2>/dev/null || true)" \
+                        "$(brew --prefix llvm 2>/dev/null || true)"; do
+            if [ -n "$prefix" ] && [ -x "$prefix/bin/ld.lld" ]; then
+              LLD_BIN="$prefix/bin"
+              break
+            fi
+          done
+          if [ -z "$LLD_BIN" ]; then
+            echo "镜像里没有现成的 ld.lld，改为安装 lld formula"
+            brew install lld
+            LLD_BIN="$(brew --prefix lld)/bin"
+          fi
+          echo "使用 $LLD_BIN/ld.lld"
+          "$LLD_BIN/ld.lld" --version
+          # 后续步骤（make emulator）需要能在 PATH 里找到 ld.lld。
+          echo "$LLD_BIN" >> "$GITHUB_PATH"
+
+          echo "== 其余工具版本 =="
+          node --version
+          npm --version
+          ruby --version
+          meson --version
+          ninja --version
+
+          # Xcode 里的 "Build Meson (iSH-ARM64)" 阶段会执行 iSH 自带的
+          # xcode-meson.sh / xcode-ninja.sh，而这两个脚本开头都有一句
+          #   export PATH="$PATH:$(sudo -u "$USER" -i printenv PATH)"
+          # 这里用 -n（非交互，绝不提示密码）先探一次，免得万一 sudo 不
+          # 免密时卡在构建中途。即使不可用，命令替换失败也只是补不到 PATH，
+          # 脚本仍会继续，而我们需要的 meson/ninja/ld.lld 早就在 PATH 里了。
+          if sudo -n -u "$USER" -i printenv PATH >/dev/null 2>&1; then
+            echo "sudo 免密可用"
+          else
+            echo "::warning::sudo 免密不可用；iSH 的构建脚本补不到 PATH，但通常仍能继续"
+          fi
+
+      - name: 构建 iSH-ARM64 模拟器
+        run: make emulator
+
+      - name: 构建 guest 镜像（Alpine + Node 22 + dsh，约 95MB，需要联网）
+        run: make rootfs
+
+      - name: 归档 App（未签名）
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild \
+            -project DSH.xcodeproj \
+            -scheme DSH \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/DSH.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive 2>&1 | tee build/xcodebuild.log
+
+      - name: 打包未签名 ipa
+        run: |
+          set -euo pipefail
+          APP="$(find build/DSH.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::archive 里找不到 .app"
+            find build/DSH.xcarchive -maxdepth 4 | head -50
+            exit 1
+          fi
+          echo "App bundle: $APP"
+
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          ( cd build/ipa && zip -qry ../dsh-ios-unsigned.ipa Payload )
+
+          echo "== 产物 =="
+          ls -lh build/dsh-ios-unsigned.ipa
+
+          echo "== App bundle 顶层内容 =="
+          ls -la "$APP" | head -40
+
+          if find "$APP" -maxdepth 2 -name 'root.tar.gz' | grep -q .; then
+            echo "OK: guest 镜像 root.tar.gz 已打进 bundle"
+          else
+            echo "::warning::bundle 里没找到 root.tar.gz，app 启动后可能无法导入 guest"
+          fi
+
+          echo "== 签名状态（预期为未签名，侧载工具会自己重签）=="
+          codesign -dv --verbose=2 "$APP" 2>&1 || true
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-ios-unsigned-ipa
+          path: build/dsh-ios-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 失败时上传 xcodebuild 日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
